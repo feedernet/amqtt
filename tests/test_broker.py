@@ -3,8 +3,11 @@
 # See the file license.txt for copying permission.
 import asyncio
 import logging
-from unittest.mock import call, MagicMock
+import socket
+import sys
+from unittest.mock import call, MagicMock, patch
 
+import psutil
 import pytest
 
 from amqtt.adapters import StreamReaderAdapter, StreamWriterAdapter
@@ -31,6 +34,7 @@ from amqtt.mqtt import (
 )
 from amqtt.mqtt.connect import ConnectVariableHeader, ConnectPayload
 from amqtt.mqtt.constants import QOS_0, QOS_1, QOS_2
+from amqtt.mqtt.protocol.broker_handler import BrokerProtocolHandler
 
 
 formatter = (
@@ -91,6 +95,43 @@ async def test_client_connect(broker, mock_plugin_manager):
         ],
         any_order=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_connect_tcp(broker):
+    process = psutil.Process()
+    connections_number = 10
+    sockets = [
+        socket.create_connection(("127.0.0.1", 1883)) for _ in range(connections_number)
+    ]
+    connections = process.connections()
+    await asyncio.sleep(0.1)
+
+    # max number of connections is 10
+    assert broker._servers["default"].conn_count == connections_number
+    # Extra connection for the listening Broker
+    assert len(connections) == connections_number + 1
+    for conn in connections:
+        assert conn.status == "ESTABLISHED" or conn.status == "LISTEN"
+
+    # close all connections
+    for s in sockets:
+        s.close()
+    connections = process.connections()
+    for conn in connections:
+        assert conn.status == "CLOSE_WAIT" or conn.status == "LISTEN"
+    await asyncio.sleep(0.1)
+    assert broker._servers["default"].conn_count == 0
+
+    # Add one more connection
+    s = socket.create_connection(("127.0.0.1", 1883))
+    open_connections = []
+    for conn in process.connections():
+        if conn.status == "ESTABLISHED":
+            open_connections.append(conn)
+    assert len(open_connections) == 1
+    await asyncio.sleep(0.1)
+    assert broker._servers["default"].conn_count == 1
 
 
 @pytest.mark.asyncio
@@ -625,3 +666,34 @@ def test_matches_single_level_wildcard(broker):
         "sport/tennis/player2",
     ]:
         assert broker.matches(good_topic, test_filter)
+
+
+@pytest.mark.asyncio
+async def test_broker_broadcast_cancellation(broker):
+    topic = "test"
+    data = b"data"
+    qos = QOS_0
+
+    sub_client = MQTTClient()
+    await sub_client.connect("mqtt://127.0.0.1")
+    await sub_client.subscribe([(topic, qos)])
+
+    with patch.object(
+        BrokerProtocolHandler, "mqtt_publish", side_effect=asyncio.CancelledError
+    ) as mocked_mqtt_publish:
+        await _client_publish(topic, data, qos)
+
+        # Second publish triggers the awaiting of first `mqtt_publish` task
+        await _client_publish(topic, data, qos)
+        await asyncio.sleep(0.01)
+
+        # `assert_awaited` does not exist in Python before `3.8`
+        if sys.version_info >= (3, 8):
+            mocked_mqtt_publish.assert_awaited()
+        else:
+            mocked_mqtt_publish.assert_called()
+
+    # Ensure broadcast loop is still functional and can deliver the message
+    await _client_publish(topic, data, qos)
+    message = await asyncio.wait_for(sub_client.deliver_message(), timeout=1)
+    assert message
