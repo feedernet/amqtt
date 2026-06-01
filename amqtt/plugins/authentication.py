@@ -1,112 +1,114 @@
-# Copyright (c) 2015 Nicolas JOUANIN
-#
-# See the file license.txt for copying permission.
-import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
 from passlib.apps import custom_app_context as pwd_context
 
+from amqtt.broker import BrokerContext
+from amqtt.contexts import BaseContext
+from amqtt.plugins.base import BaseAuthPlugin
+from amqtt.session import Session
 
-class BaseAuthPlugin:
-    def __init__(self, context):
-        self.context = context
-        try:
-            self.auth_config = self.context.config["auth"]
-        except KeyError:
-            self.context.logger.warning(
-                "'auth' section not found in context configuration"
-            )
-
-    def authenticate(self, *args, **kwargs):
-        if not self.auth_config:
-            # auth config section not found
-            self.context.logger.warning(
-                "'auth' section not found in context configuration"
-            )
-            return False
-        return True
+_PARTS_EXPECTED_LENGTH = 2  # Expected number of parts in a valid line
 
 
 class AnonymousAuthPlugin(BaseAuthPlugin):
-    def __init__(self, context):
+    """Authentication plugin allowing anonymous access."""
+
+    def __init__(self, context: BaseContext) -> None:
         super().__init__(context)
 
-    async def authenticate(self, *args, **kwargs):
-        authenticated = super().authenticate(*args, **kwargs)
+        # Default to allowing anonymous
+        self._allow_anonymous = self._get_config_option("allow-anonymous", True)  # noqa: FBT003
+
+    async def authenticate(self, *, session: Session) -> bool:
+        authenticated = await super().authenticate(session=session)
         if authenticated:
-            allow_anonymous = self.auth_config.get(
-                "allow-anonymous", True
-            )  # allow anonymous by default
-            if allow_anonymous:
-                authenticated = True
-                self.context.logger.debug(
-                    "Authentication success: config allows anonymous"
-                )
-            else:
-                try:
-                    session = kwargs.get("session", None)
-                    authenticated = True if session.username else False
-                    if self.context.logger.isEnabledFor(logging.DEBUG):
-                        if authenticated:
-                            self.context.logger.debug(
-                                "Authentication success: session has a non empty username"
-                            )
-                        else:
-                            self.context.logger.debug(
-                                "Authentication failure: session has an empty username"
-                            )
-                except KeyError:
-                    self.context.logger.warning("Session information not available")
-                    authenticated = False
-        return authenticated
+
+            if self._allow_anonymous:
+                self.context.logger.debug("Authentication success: config allows anonymous")
+                session.is_anonymous = True
+                return True
+
+            if session and session.username:
+                self.context.logger.debug(f"Authentication success: session has username '{session.username}'")
+                return True
+            self.context.logger.debug("Authentication failure: session has no username")
+        return False
+
+    @dataclass
+    class Config:
+        """Configuration for AnonymousAuthPlugin."""
+
+        allow_anonymous: bool = field(default=True)
+        """Allow all anonymous authentication (even with _no_ username)."""
 
 
 class FileAuthPlugin(BaseAuthPlugin):
-    def __init__(self, context):
+    """Authentication plugin based on a file-stored user database."""
+
+    def __init__(self, context: BrokerContext) -> None:
         super().__init__(context)
-        self._users = dict()
+        self._users: dict[str, str] = {}
         self._read_password_file()
 
-    def _read_password_file(self):
-        password_file = self.auth_config.get("password-file", None)
-        if password_file:
-            try:
-                with open(password_file) as f:
-                    self.context.logger.debug(
-                        "Reading user database from %s" % password_file
-                    )
-                    for line in f:
-                        line = line.strip()
-                        if not line.startswith("#"):  # Allow comments in files
-                            (username, pwd_hash) = line.split(sep=":", maxsplit=3)
-                            if username:
-                                self._users[username] = pwd_hash
-                                self.context.logger.debug(
-                                    "user %s , hash=%s" % (username, pwd_hash)
-                                )
-                self.context.logger.debug(
-                    "%d user(s) read from file %s" % (len(self._users), password_file)
-                )
-            except FileNotFoundError:
-                self.context.logger.warning(
-                    "Password file %s not found" % password_file
-                )
-        else:
-            self.context.logger.debug(
-                "Configuration parameter 'password_file' not found"
-            )
+    def _read_password_file(self) -> None:
+        """Read the password file and populates the user dictionary."""
+        password_file = self._get_config_option("password-file", None)
+        if not password_file:
+            self.context.logger.warning("Configuration parameter 'password-file' not found")
+            return
 
-    async def authenticate(self, *args, **kwargs):
-        authenticated = super().authenticate(*args, **kwargs)
+        try:
+            file = password_file
+            if isinstance(file, str):
+                file = Path(file)
+            with file.open(mode="r", encoding="utf-8") as file:
+                self.context.logger.debug(f"Reading user database from {password_file}")
+                for _line in file:
+                    line = _line.strip()
+                    if line and not line.startswith("#"):  # Skip empty lines and comments
+                        parts = line.split(":", maxsplit=1)
+                        if len(parts) == _PARTS_EXPECTED_LENGTH:
+                            username, pwd_hash = parts
+                            self._users[username] = pwd_hash
+                            self.context.logger.debug(f"User '{username}' loaded")
+                        else:
+                            self.context.logger.warning(f"Malformed line in password file: {line}")
+            self.context.logger.info(f"{len(self._users)} user(s) loaded from {password_file}")
+        except FileNotFoundError:
+            self.context.logger.warning(f"Password file '{password_file}' not found")
+        except ValueError:
+            self.context.logger.exception(f"Malformed password file '{password_file}'")
+        except OSError:
+            self.context.logger.exception(f"Unexpected error reading password file '{password_file}'")
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        """Authenticate users based on the file-stored user database."""
+        authenticated = await super().authenticate(session=session)
         if authenticated:
-            session = kwargs.get("session", None)
-            if session.username:
-                hash = self._users.get(session.username, None)
-                if not hash:
-                    authenticated = False
-                    self.context.logger.debug(
-                        "No hash found for user '%s'" % session.username
-                    )
-                else:
-                    authenticated = pwd_context.verify(session.password, hash)
-            else:
+            if not session:
+                self.context.logger.debug("Authentication failure: no session provided")
+                return False
+
+            if not session.username:
+                self.context.logger.debug("Authentication failure: no username provided in session")
                 return None
-        return authenticated
+
+            hash_session_username = self._users.get(session.username)
+            if not hash_session_username:
+                self.context.logger.debug(f"Authentication failure: no hash found for user '{session.username}'")
+                return False
+
+            if pwd_context.verify(session.password, hash_session_username):
+                self.context.logger.debug(f"Authentication success for user '{session.username}'")
+                return True
+
+            self.context.logger.debug(f"Authentication failure: password mismatch for user '{session.username}'")
+        return False
+
+    @dataclass
+    class Config:
+        """Configuration for FileAuthPlugin."""
+
+        password_file: str | Path | None = None
+        """Path to file with `username:password` pairs, one per line. All passwords are encoded using sha-512."""

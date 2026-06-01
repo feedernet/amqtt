@@ -1,0 +1,27 @@
+---
+listeners:
+  default:
+    type: tcp
+    bind: 0.0.0.0:1883
+  std-ws:
+    type: ws
+    bind: 0.0.0.0:8080
+  tls-mqtt:
+    type: tcp
+    bind: 0.0.0.0:8883
+    ssl: on
+    certfile: /etc/letsencrypt/live/test.amqtt.io/fullchain.pem
+    keyfile: /etc/letsencrypt/live/test.amqtt.io/privkey.pem
+  tls-ws:
+    type: ws
+    bind: 0.0.0.0:8443
+    ssl: on
+    certfile: /etc/letsencrypt/live/test.amqtt.io/fullchain.pem
+    keyfile: /etc/letsencrypt/live/test.amqtt.io/privkey.pem
+plugins:
+  amqtt.plugins.logging_amqtt.EventLoggerPlugin:
+  amqtt.plugins.logging_amqtt.PacketLoggerPlugin:
+  amqtt.plugins.authentication.AnonymousAuthPlugin:
+    allow_anonymous: true
+  amqtt.plugins.sys.broker.BrokerSysPlugin:
+    sys_interval: 2

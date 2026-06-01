@@ -1,0 +1,12 @@
+[run]
+branch = True
+source = bumper
+
+omit =
+    tests/*
+    amqtt/scripts/*.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:

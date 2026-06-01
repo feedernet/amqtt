@@ -1,50 +1,48 @@
-import logging
 import asyncio
+import logging
 
-from amqtt.client import MQTTClient, ClientException
+from amqtt.client import ClientError, MQTTClient
 from amqtt.mqtt.constants import QOS_1
 
+"""
+Run `samples/broker_acl.py` or `samples/broker_taboo.py` 
 
-#
-# This sample shows how to subscbribe a topic and receive data from incoming messages
-# It subscribes to '$SYS/broker/uptime' topic and displays the first ten values returned
-# by the broker.
-#
+This sample shows how to subscribe to different topics, some of which are allowed. 
+"""
 
 logger = logging.getLogger(__name__)
 
 
-async def uptime_coro():
-    C = MQTTClient()
-    await C.connect("mqtt://test:test@0.0.0.0:1883")
-    # await C.connect('mqtt://0.0.0.0:1883')
-    # Subscribe to '$SYS/broker/uptime' with QOS=1
-    await C.subscribe(
+async def uptime_coro() -> None:
+    client = MQTTClient()
+    await client.connect("mqtt://test:test@0.0.0.0:1883")
+
+    result = await client.subscribe(
         [
+            ("$SYS/#", QOS_1),  # Topic forbidden when running `broker_acl.py`
             ("data/memes", QOS_1),  # Topic allowed
             ("data/classified", QOS_1),  # Topic forbidden
             ("repositories/amqtt/master", QOS_1),  # Topic allowed
-            ("repositories/amqtt/devel", QOS_1),  # Topic forbidden
+            ("repositories/amqtt/devel", QOS_1),  # Topic forbidden when running `broker_acl.py`
             ("calendar/amqtt/releases", QOS_1),  # Topic allowed
-        ]
+        ],
     )
-    logger.info("Subscribed")
+    logger.info(f"Subscribed results: {result}")
     try:
-        for i in range(1, 100):
-            message = await C.deliver_message()
-            packet = message.publish_packet
-            print(
-                "%d: %s => %s"
-                % (i, packet.variable_header.topic_name, str(packet.payload.data))
-            )
-        await C.unsubscribe(["$SYS/broker/uptime", "$SYS/broker/load/#"])
+        for _i in range(1, 100):
+            if msg := await client.deliver_message():
+                logger.info(f"{msg.topic} >> {msg.data.decode()}")
+        await client.unsubscribe(["$SYS/#", "data/memes"])
         logger.info("UnSubscribed")
-        await C.disconnect()
-    except ClientException as ce:
-        logger.error("Client exception: %s" % ce)
+        await client.disconnect()
+    except ClientError:
+        logger.exception("Client exception")
 
 
-if __name__ == "__main__":
+def __main__():
     formatter = "[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s"
     logging.basicConfig(level=logging.INFO, format=formatter)
     asyncio.get_event_loop().run_until_complete(uptime_coro())
+
+if __name__ == "__main__":
+    __main__()
